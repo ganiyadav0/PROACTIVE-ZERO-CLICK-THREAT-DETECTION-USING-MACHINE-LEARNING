@@ -1,0 +1,430 @@
+"""
+capture.py  –  Live packet capture using Npcap/Scapy
+Extracts CIC-IDS2017-compatible flow features, runs the two-stage XGBoost
+pipeline, and pushes results into a capped ring-buffer shared with Flask.
+
+Usage (standalone test):
+    python capture.py --iface "Ethernet" --duration 30
+"""
+
+import threading
+import time
+import random
+import argparse
+import collections
+import numpy as np
+from datetime import datetime
+
+# ── Try importing scapy (requires Npcap on Windows) ─────────────────────────
+try:
+    from scapy.all import sniff, IP, TCP, UDP, ICMP
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+    print("⚠  Scapy not found. Run:  pip install scapy")
+
+# ── Shared state (imported by app.py) ────────────────────────────────────────
+MAX_BUFFER   = 500          # max events kept in ring-buffer
+FLOW_TIMEOUT = 15           # seconds before an idle flow is flushed (was 120 – too slow)
+
+capture_buffer  = collections.deque(maxlen=MAX_BUFFER)  # ring-buffer of events
+capture_stats   = {
+    "running":       False,
+    "iface":         None,
+    "packets_seen":  0,
+    "flows_flushed": 0,
+    "dropped":       0,       # packets dropped due to buffer pressure
+    "start_time":    None,
+}
+_capture_thread = None
+_stop_event     = threading.Event()
+
+# ── Active flow table  {flow_key: FlowStats} ─────────────────────────────────
+_flow_table = {}
+_flow_lock  = threading.Lock()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class FlowStats:
+    """Accumulates per-flow statistics needed to recreate CIC-IDS2017 features."""
+
+    def __init__(self, src_ip, dst_ip, sport, dport, proto):
+        self.src_ip  = src_ip
+        self.dst_ip  = dst_ip
+        self.sport   = sport
+        self.dport   = dport
+        self.proto   = proto
+        self.start   = time.time()
+        self.last    = time.time()
+
+        # packet / byte counters (fwd = src→dst, bwd = dst→src)
+        self.fwd_pkts  = 0;  self.bwd_pkts  = 0
+        self.fwd_bytes = 0;  self.bwd_bytes = 0
+
+        # length lists for std/mean
+        self.fwd_lens = [];  self.bwd_lens = []
+
+        # IAT (inter-arrival time) lists
+        self.fwd_iats = [];  self.bwd_iats = []
+        self.all_iats = []
+        self._last_fwd = None;  self._last_bwd = None;  self._last_any = None
+
+        # TCP flag counters
+        self.fin=0; self.syn=0; self.rst=0; self.psh=0
+        self.ack=0; self.urg=0
+
+        # window / header sizes
+        self.fwd_win_sizes = [];  self.bwd_win_sizes = []
+        self.fwd_hdr_lens  = [];  self.bwd_hdr_lens  = []
+
+        # active / idle tracking
+        self.active_start = time.time()
+        self.active_times = [];  self.idle_times = []
+        self._last_active = time.time()
+        self.ACTIVE_THRESH = 5.0   # seconds gap → new "active" window
+
+    def add_packet(self, pkt_len, direction, flags=0, win=0, hdr_len=0):
+        now  = time.time()
+        iat  = (now - self._last_any) if self._last_any else 0.0
+        self.all_iats.append(iat * 1000)  # ms
+        self._last_any = now
+        self.last = now
+
+        # active / idle
+        gap = now - self._last_active
+        if gap > self.ACTIVE_THRESH:
+            self.idle_times.append(gap * 1000)
+            self.active_times.append((now - self.active_start) * 1000)
+            self.active_start = now
+        self._last_active = now
+
+        if direction == 'fwd':
+            self.fwd_pkts  += 1
+            self.fwd_bytes += pkt_len
+            self.fwd_lens.append(pkt_len)
+            self.fwd_win_sizes.append(win)
+            self.fwd_hdr_lens.append(hdr_len)
+            if self._last_fwd:
+                self.fwd_iats.append((now - self._last_fwd) * 1000)
+            self._last_fwd = now
+        else:
+            self.bwd_pkts  += 1
+            self.bwd_bytes += pkt_len
+            self.bwd_lens.append(pkt_len)
+            self.bwd_win_sizes.append(win)
+            self.bwd_hdr_lens.append(hdr_len)
+            if self._last_bwd:
+                self.bwd_iats.append((now - self._last_bwd) * 1000)
+            self._last_bwd = now
+
+        # TCP flags
+        if flags & 0x01: self.fin += 1
+        if flags & 0x02: self.syn += 1
+        if flags & 0x04: self.rst += 1
+        if flags & 0x08: self.psh += 1
+        if flags & 0x10: self.ack += 1
+        if flags & 0x20: self.urg += 1
+
+    # ── Feature vector ─────────────────────────────────────────────────────
+    def to_feature_dict(self):
+        dur = max(self.last - self.start, 1e-6)
+
+        def _safe(lst):
+            return lst if lst else [0.0]
+
+        fl = _safe(self.fwd_lens);  bl = _safe(self.bwd_lens)
+        fi = _safe(self.fwd_iats);  bi = _safe(self.bwd_iats)
+        ai = _safe(self.all_iats)
+        fa = _safe(self.active_times);  idle = _safe(self.idle_times)
+
+        total_pkts  = self.fwd_pkts  + self.bwd_pkts
+        total_bytes = self.fwd_bytes + self.bwd_bytes
+
+        return {
+            ' Destination Port':                 self.dport,
+            ' Flow Duration':                    dur * 1e6,   # µs
+            ' Total Fwd Packets':                self.fwd_pkts,
+            ' Total Backward Packets':           self.bwd_pkts,
+            'Total Length of Fwd Packets':       self.fwd_bytes,
+            ' Total Length of Bwd Packets':      self.bwd_bytes,
+            ' Fwd Packet Length Max':            max(fl),
+            ' Fwd Packet Length Min':            min(fl),
+            ' Fwd Packet Length Mean':           np.mean(fl),
+            ' Fwd Packet Length Std':            np.std(fl),
+            'Bwd Packet Length Max':             max(bl),
+            ' Bwd Packet Length Min':            min(bl),
+            ' Bwd Packet Length Mean':           np.mean(bl),
+            ' Bwd Packet Length Std':            np.std(bl),
+            'Flow Bytes/s':                      total_bytes / dur,
+            ' Flow Packets/s':                   total_pkts  / dur,
+            ' Flow IAT Mean':                    np.mean(ai),
+            ' Flow IAT Std':                     np.std(ai),
+            ' Flow IAT Max':                     max(ai),
+            ' Flow IAT Min':                     min(ai),
+            'Fwd IAT Total':                     sum(fi),
+            ' Fwd IAT Mean':                     np.mean(fi),
+            ' Fwd IAT Std':                      np.std(fi),
+            ' Fwd IAT Max':                      max(fi),
+            ' Fwd IAT Min':                      min(fi),
+            'Bwd IAT Total':                     sum(bi),
+            ' Bwd IAT Mean':                     np.mean(bi),
+            ' Bwd IAT Std':                      np.std(bi),
+            ' Bwd IAT Max':                      max(bi),
+            ' Bwd IAT Min':                      min(bi),
+            'Fwd PSH Flags':                     self.psh,
+            ' Bwd PSH Flags':                    0,
+            ' Fwd URG Flags':                    self.urg,
+            ' Bwd URG Flags':                    0,
+            ' Fwd Header Length':                np.mean(_safe(self.fwd_hdr_lens)),
+            ' Bwd Header Length':                np.mean(_safe(self.bwd_hdr_lens)),
+            'Fwd Packets/s':                     self.fwd_pkts / dur,
+            ' Bwd Packets/s':                    self.bwd_pkts / dur,
+            ' Min Packet Length':                min(fl + bl),
+            ' Max Packet Length':                max(fl + bl),
+            ' Packet Length Mean':               np.mean(fl + bl),
+            ' Packet Length Std':                np.std(fl + bl),
+            ' Packet Length Variance':           np.var(fl + bl),
+            'FIN Flag Count':                    self.fin,
+            ' SYN Flag Count':                   self.syn,
+            ' RST Flag Count':                   self.rst,
+            ' PSH Flag Count':                   self.psh,
+            ' ACK Flag Count':                   self.ack,
+            ' URG Flag Count':                   self.urg,
+            ' CWE Flag Count':                   0,
+            ' ECE Flag Count':                   0,
+            ' Down/Up Ratio':                    self.bwd_bytes / max(self.fwd_bytes, 1),
+            ' Average Packet Size':              total_bytes   / max(total_pkts, 1),
+            ' Avg Fwd Segment Size':             self.fwd_bytes / max(self.fwd_pkts, 1),
+            ' Avg Bwd Segment Size':             self.bwd_bytes / max(self.bwd_pkts, 1),
+            ' Fwd Header Length.1':              np.mean(_safe(self.fwd_hdr_lens)),
+            'Fwd Avg Bytes/Bulk':                0,
+            ' Fwd Avg Packets/Bulk':             0,
+            ' Fwd Avg Bulk Rate':                0,
+            ' Bwd Avg Bytes/Bulk':               0,
+            ' Bwd Avg Packets/Bulk':             0,
+            'Bwd Avg Bulk Rate':                 0,
+            'Subflow Fwd Packets':               self.fwd_pkts,
+            ' Subflow Fwd Bytes':                self.fwd_bytes,
+            ' Subflow Bwd Packets':              self.bwd_pkts,
+            ' Subflow Bwd Bytes':                self.bwd_bytes,
+            'Init_Win_bytes_forward':            _safe(self.fwd_win_sizes)[0],
+            ' Init_Win_bytes_backward':          _safe(self.bwd_win_sizes)[0],
+            ' act_data_pkt_fwd':                 self.fwd_pkts,
+            ' min_seg_size_forward':             min(fl),
+            'Active Mean':                       np.mean(fa),
+            ' Active Std':                       np.std(fa),
+            ' Active Max':                       max(fa),
+            ' Active Min':                       min(fa),
+            'Idle Mean':                         np.mean(idle),
+            ' Idle Std':                         np.std(idle),
+            ' Idle Max':                         max(idle),
+            ' Idle Min':                         min(idle),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def _flow_key(src, dst, sport, dport, proto):
+    """Bi-directional flow key."""
+    a = (src, sport);  b = (dst, dport)
+    if a > b:
+        a, b = b, a
+    return (a, b, proto)
+
+
+def _process_packet(pkt):
+    """Called by scapy for every captured packet."""
+    if not pkt.haslayer(IP):
+        return
+
+    capture_stats["packets_seen"] += 1
+
+    ip   = pkt[IP]
+    src  = ip.src;  dst = ip.dst
+    proto = ip.proto
+
+    sport = dport = 0
+    flags = win = hdr_len = 0
+    pkt_len = len(pkt)
+
+    if pkt.haslayer(TCP):
+        tcp    = pkt[TCP]
+        sport  = tcp.sport;  dport = tcp.dport
+        flags  = int(tcp.flags)
+        win    = tcp.window
+        hdr_len = tcp.dataofs * 4
+    elif pkt.haslayer(UDP):
+        udp    = pkt[UDP]
+        sport  = udp.sport;  dport = udp.dport
+        hdr_len = 8
+
+    key = _flow_key(src, dst, sport, dport, proto)
+
+    with _flow_lock:
+        if key not in _flow_table:
+            _flow_table[key] = FlowStats(src, dst, sport, dport, proto)
+
+        flow = _flow_table[key]
+        direction = 'fwd' if (flow.src_ip == src) else 'bwd'
+        flow.add_packet(pkt_len, direction, flags, win, hdr_len)
+
+
+def _flush_expired_flows(predict_fn):
+    """Background thread: flush flows that have been idle > FLOW_TIMEOUT seconds."""
+    while not _stop_event.is_set():
+        time.sleep(3)          # check every 3 s (was 10 s – too infrequent)
+        now = time.time()
+        to_flush = []
+
+        with _flow_lock:
+            for key, flow in list(_flow_table.items()):
+                idle_too_long = (now - flow.last)  > FLOW_TIMEOUT
+                age_too_long  = (now - flow.start) > 30   # force-flush after 30 s
+                if idle_too_long or age_too_long:
+                    to_flush.append(key)
+
+        for key in to_flush:
+            with _flow_lock:
+                flow = _flow_table.pop(key, None)
+            if flow and flow.fwd_pkts + flow.bwd_pkts >= 1:   # was >=2; allow single-pkt flows
+                _predict_and_buffer(flow, predict_fn)
+                capture_stats["flows_flushed"] += 1
+
+
+def _predict_and_buffer(flow, predict_fn):
+    """Run the model on a completed flow and push to ring-buffer."""
+    try:
+        feat = flow.to_feature_dict()
+        label, anom_prob, conf = predict_fn(feat)
+
+        from datetime import datetime
+        ev = {
+            'timestamp':  datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'label':      label,
+            'severity':   _severity(label),
+            'anom_prob':  round(anom_prob * 100, 1),
+            'confidence': round(conf * 100, 1),
+            'src_ip':     flow.src_ip,
+            'dst_ip':     flow.dst_ip,
+            'port':       flow.dport,
+            'fwd_pkts':   flow.fwd_pkts,
+            'bwd_pkts':   flow.bwd_pkts,
+            'source':     'live',
+        }
+        # MITRE mapping (imported lazily to avoid circular import)
+        from app import MITRE_MAP
+        mitre = MITRE_MAP.get(label, MITRE_MAP['ZERO_CLICK'])
+        ev['mitre_id']   = mitre['id']
+        ev['mitre_name'] = mitre['name']
+        ev['tactic']     = mitre['tactic']
+
+        capture_buffer.append(ev)
+
+    except Exception as e:
+        print(f"[capture] predict error: {e}")
+
+
+SEVERITY_MAP = {
+    'SAFE':'safe','ZERO_CLICK':'critical',
+    'DDoS':'high','DoS Hulk':'high','DoS GoldenEye':'high','Bot':'high',
+    'DoS Slowhttptest':'medium','DoS slowloris':'medium','PortScan':'medium',
+    'FTP-Patator':'medium','SSH-Patator':'medium',
+    'Web Attack_Brute Force':'medium','Web Attack_XSS':'medium',
+}
+
+def _severity(label):
+    return SEVERITY_MAP.get(label, 'medium')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def start_capture(iface, predict_fn, packet_filter="ip"):
+    """
+    Start live capture on `iface`.
+    predict_fn(feature_dict) → (label, anom_prob, conf)
+    """
+    global _capture_thread
+    if capture_stats["running"]:
+        return False, "Already running"
+
+    if not SCAPY_AVAILABLE:
+        return False, "Scapy not installed"
+
+    _stop_event.clear()
+    capture_stats.update({
+        "running": True, "iface": iface,
+        "packets_seen": 0, "flows_flushed": 0, "dropped": 0,
+        "start_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    })
+
+    # Flush thread
+    flush_thread = threading.Thread(
+        target=_flush_expired_flows, args=(predict_fn,), daemon=True)
+    flush_thread.start()
+
+    # Capture thread
+    def _run():
+        try:
+            sniff(iface=iface, filter=packet_filter,
+                  prn=_process_packet, store=False,
+                  stop_filter=lambda _: _stop_event.is_set())
+        except Exception as e:
+            print(f"[capture] sniff error: {e}")
+        finally:
+            # flush remaining flows
+            with _flow_lock:
+                remaining = list(_flow_table.items())
+            for key, flow in remaining:
+                if flow.fwd_pkts + flow.bwd_pkts >= 1:   # was >=2
+                    _predict_and_buffer(flow, predict_fn)
+            with _flow_lock:
+                _flow_table.clear()
+            capture_stats["running"] = False
+            print("[capture] stopped.")
+
+    _capture_thread = threading.Thread(target=_run, daemon=True)
+    _capture_thread.start()
+    return True, "Capture started"
+
+
+def stop_capture():
+    _stop_event.set()
+    capture_stats["running"] = False
+    return True, "Stopping..."
+
+
+def list_interfaces():
+    """Return list of interface names visible to Npcap."""
+    if not SCAPY_AVAILABLE:
+        return []
+    try:
+        from scapy.arch.windows import get_windows_if_list
+        ifaces = get_windows_if_list()
+        return [i.get('name') or i.get('description','?') for i in ifaces]
+    except Exception:
+        try:
+            from scapy.all import get_if_list
+            return get_if_list()
+        except Exception:
+            return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='ZeroThreat live capture test')
+    parser.add_argument('--iface',    default=None, help='Network interface name')
+    parser.add_argument('--duration', type=int, default=30, help='Seconds to capture')
+    args = parser.parse_args()
+
+    print("Available interfaces:", list_interfaces())
+
+    def dummy_predict(feat):
+        return random.choice(['SAFE','SAFE','SAFE','PortScan','DDoS']), \
+               random.uniform(0, 1), random.uniform(0.5, 1)
+
+    iface = args.iface or (list_interfaces() or ['eth0'])[0]
+    ok, msg = start_capture(iface, dummy_predict)
+    print(msg)
+    time.sleep(args.duration)
+    stop_capture()
+    print(f"Buffer has {len(capture_buffer)} events")
+    for ev in list(capture_buffer)[-5:]:
+        print(ev)
